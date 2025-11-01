@@ -1,127 +1,160 @@
 package monitor
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+
+	//"fmt" // Import fmt for Sprintf
 	"log"
+	"net/http"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 )
 
-// Controller watches for pod events in the Kubernetes cluster
+// Controller holds the clientset and the informer
 type Controller struct {
-	clientset      *kubernetes.Clientset
-	informerFactory informers.SharedInformerFactory
-	podInformer    cache.SharedIndexInformer
-	queue          workqueue.RateLimitingInterface
+	Clientset kubernetes.Interface
+	Informer  cache.SharedIndexInformer
 }
 
-// NewController creates a new Controller instance
+// NewController creates a new controller
 func NewController(clientset *kubernetes.Clientset) *Controller {
-	informerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*5)
-	podInformer := informerFactory.Core().V1().Pods().Informer()
+	factory := informers.NewSharedInformerFactory(clientset, 10*time.Minute)
+	podInformer := factory.Core().V1().Pods().Informer()
 
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
-
-	controller := &Controller{
-		clientset:      clientset,
-		informerFactory: informerFactory,
-		podInformer:    podInformer,
-		queue:          queue,
+	c := &Controller{
+		Clientset: clientset,
+		Informer:  podInformer,
 	}
 
-	// Add event handlers
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    controller.handleAdd,
-		UpdateFunc: controller.handleUpdate,
-		DeleteFunc: controller.handleDelete,
+		AddFunc:    c.onAdd,
+		UpdateFunc: c.onUpdate,
 	})
 
-	return controller
+	return c
 }
 
-// Run starts the controller
+// Run starts the controller's informer
 func (c *Controller) Run(stopCh <-chan struct{}) {
-	defer runtime.HandleCrash()
-	defer c.queue.ShutDown()
+	log.Println("Starting monitor controller...")
+	go c.Informer.Run(stopCh)
 
-	log.Println("Starting controller...")
+	if !cache.WaitForCacheSync(stopCh, c.Informer.HasSynced) {
+		log.Fatalf("failed to sync cache")
+		return
+	}
+	log.Println("Controller cache synced")
 
-	c.informerFactory.Start(stopCh)
+	<-stopCh
+	log.Println("Stopping monitor controller...")
+}
 
-	if !cache.WaitForCacheSync(stopCh, c.podInformer.HasSynced) {
-		log.Println("Failed to sync cache")
+// onAdd is called when a pod is added
+func (c *Controller) onAdd(obj interface{}) {
+	pod := obj.(*corev1.Pod)
+	// --- MODIFIED ---
+	if isBad, reason := checkPodBadState(pod); isBad {
+		log.Printf("TRIGGER: New pod %s/%s is in bad state: %s", pod.Namespace, pod.Name, reason)
+		c.triggerAnalysis(pod, reason)
+	}
+}
+
+// onUpdate is called when a pod is modified
+func (c *Controller) onUpdate(oldObj, newObj interface{}) {
+	oldPod := oldObj.(*corev1.Pod)
+	newPod := newObj.(*corev1.Pod)
+
+	// --- MODIFIED ---
+	wasBad, _ := checkPodBadState(oldPod)
+	isBad, reason := checkPodBadState(newPod)
+
+	// Trigger only when transitioning from not-bad to bad
+	if !wasBad && isBad {
+		log.Printf("TRIGGER: Pod %s/%s has entered bad state: %s", newPod.Namespace, newPod.Name, reason)
+		c.triggerAnalysis(newPod, reason)
+	}
+}
+
+// --- NEW FUNCTION (Replaces isPodCrashLooping) ---
+// checkPodBadState checks for various failure conditions.
+// It returns true and a reason string if a failure state is detected.
+func checkPodBadState(pod *corev1.Pod) (bool, string) {
+	// 1. Check the overall Pod Phase
+	if pod.Status.Phase == corev1.PodFailed {
+		return true, "PodFailed"
+	}
+
+	// 2. Check Container Statuses
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		// Check for states like "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull"
+		if containerStatus.State.Waiting != nil {
+			reason := containerStatus.State.Waiting.Reason
+			if reason == "CrashLoopBackOff" || reason == "ImagePullBackOff" || reason == "ErrImagePull" {
+				return true, reason
+			}
+		}
+
+		// Check for containers that terminated with an "Error"
+		if containerStatus.State.Terminated != nil {
+			if containerStatus.State.Terminated.Reason == "Error" {
+				return true, "Terminated(Error)"
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// --- MODIFIED FUNCTION ---
+// triggerAnalysis calls our Python AI agent service, now with a reason
+func (c *Controller) triggerAnalysis(pod *corev1.Pod, reason string) {
+	agentURL := "http://localhost:8000/summarize-pod"
+
+	log.Printf("Triggering analysis for pod: %s/%s (Reason: %s)", pod.Namespace, pod.Name, reason)
+
+	// 1. Create the JSON payload
+	// --- MODIFIED: Added "reason" to payload ---
+	payload := map[string]string{
+		"namespace": pod.Namespace,
+		"pod_name":  pod.Name,
+		"reason":    reason,
+	}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal JSON for pod %s: %v", pod.Name, err)
 		return
 	}
 
-	log.Println("Controller synced and ready")
-
-	wait.Until(c.runWorker, time.Second, stopCh)
-}
-
-func (c *Controller) runWorker() {
-	for c.processNextItem() {
+	// 2. Send the HTTP POST request
+	req, err := http.NewRequest("POST", agentURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("ERROR: Failed to create request for pod %s: %v", pod.Name, err)
+		return
 	}
-}
+	req.Header.Set("Content-Type", "application/json")
 
-func (c *Controller) processNextItem() bool {
-	key, quit := c.queue.Get()
-	if quit {
-		return false
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("ERROR: Failed to send request to agent for pod %s: %v", pod.Name, err)
+		return
 	}
-	defer c.queue.Done(key)
+	defer resp.Body.Close()
 
-	err := c.processItem(key.(string))
-	if err == nil {
-		c.queue.Forget(key)
-	} else {
-		runtime.HandleError(err)
-		c.queue.AddRateLimited(key)
+	// 3. Log the response
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("ERROR: Agent service returned non-200 status: %s", resp.Status)
+		// We can read the body here for more error details
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("Agent error response: %s", string(body))
+		return
 	}
 
-	return true
-}
-
-func (c *Controller) processItem(key string) error {
-	log.Printf("Processing item: %s", key)
-	// TODO: Implement actual processing logic
-	// This would typically involve fetching the pod details and triggering the AI agent
-	return nil
-}
-
-func (c *Controller) handleAdd(obj interface{}) {
-	pod := obj.(*corev1.Pod)
-	log.Printf("Pod added: %s/%s", pod.Namespace, pod.Name)
-	key, err := cache.MetaNamespaceKeyFunc(obj)
-	if err == nil {
-		c.queue.Add(key)
-	}
-}
-
-func (c *Controller) handleUpdate(oldObj, newObj interface{}) {
-	oldPod := oldObj.(*corev1.Pod)
-	newPod := newObj.(*corev1.Pod)
-	
-	if oldPod.Status.Phase != newPod.Status.Phase {
-		log.Printf("Pod updated: %s/%s, Phase: %s -> %s", 
-			newPod.Namespace, newPod.Name, oldPod.Status.Phase, newPod.Status.Phase)
-		key, err := cache.MetaNamespaceKeyFunc(newObj)
-		if err == nil {
-			c.queue.Add(key)
-		}
-	}
-}
-
-func (c *Controller) handleDelete(obj interface{}) {
-	pod := obj.(*corev1.Pod)
-	log.Printf("Pod deleted: %s/%s", pod.Namespace, pod.Name)
-	key, err := cache.MetaNamespaceKeyFunc(obj)
-	if err == nil {
-		c.queue.Add(key)
-	}
+	log.Printf("Successfully triggered analysis for %s/%s. Agent responded: %s", pod.Namespace, pod.Name, resp.Status)
 }

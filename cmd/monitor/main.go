@@ -10,25 +10,26 @@ import (
 )
 
 func main() {
-	log.Println("Starting Watch-my-pod monitor...")
-
-	// Initialize Kubernetes client
-	clientset, err := monitor.GetKubernetesClient()
+	// 1. Create the Kubernetes clientset
+	clientset, err := monitor.NewClientset()
 	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client: %v", err)
+		log.Fatalf("Failed to create clientset: %v", err)
 	}
 
-	// Create and start the controller
+	// 2. Create the controller
 	controller := monitor.NewController(clientset)
+
+	// 3. Set up a channel to handle OS shutdown signals
 	stopCh := make(chan struct{})
-	defer close(stopCh)
-
-	go controller.Run(stopCh)
-
-	// Wait for interrupt signal to gracefully shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
 
-	log.Println("Shutting down Watch-my-pod monitor...")
+	go func() {
+		<-sigCh
+		log.Println("Shutdown signal received, stopping controller...")
+		close(stopCh)
+	}()
+
+	// 4. Run the controller
+	controller.Run(stopCh)
 }

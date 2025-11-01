@@ -1,137 +1,62 @@
-"""
-Alerter module for sending notifications to Slack.
-"""
-
-import logging
 import os
-from typing import Dict, Any
-import requests
+import httpx
+import logging
 
 logger = logging.getLogger(__name__)
 
+# Get the webhook URL from the environment
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-class SlackAlerter:
+if not SLACK_WEBHOOK_URL:
+    logger.warning("SLACK_WEBHOOK_URL is not set. Slack alerts will be disabled.")
+    logger.warning("Please add it to your .env file.")
+
+# We use a persistent client for performance
+client = httpx.Client()
+
+def send_slack_alert(summary_text: str):
     """
-    Alerter for sending messages to Slack.
+    Formats the AI summary and sends it to the configured Slack channel.
     """
+    if not SLACK_WEBHOOK_URL:
+        logger.error("Attempted to send Slack alert, but SLACK_WEBHOOK_URL is not configured.")
+        return
 
-    def __init__(self):
-        """Initialize the Slack alerter."""
-        self.webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-        if not self.webhook_url:
-            logger.warning("SLACK_WEBHOOK_URL not set. Slack notifications disabled.")
-        else:
-            logger.info("Slack alerter initialized")
-
-    def send_alert(self, message: Dict[str, Any]) -> bool:
-        """
-        Send an alert message to Slack.
-
-        Args:
-            message: Dictionary containing alert information
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.webhook_url:
-            logger.warning("Cannot send Slack alert: webhook URL not configured")
-            return False
-
-        try:
-            # Format the message for Slack
-            slack_message = self._format_message(message)
-            
-            response = requests.post(
-                self.webhook_url,
-                json=slack_message,
-                timeout=10
-            )
-
-            if response.status_code == 200:
-                logger.info("Successfully sent Slack alert")
-                return True
-            else:
-                logger.error(f"Failed to send Slack alert: {response.status_code}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error sending Slack alert: {e}")
-            return False
-
-    def _format_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Format the message for Slack.
-
-        Args:
-            message: Raw message dictionary
-
-        Returns:
-            Formatted Slack message
-        """
-        pod_name = message.get("pod_name", "Unknown")
-        namespace = message.get("namespace", "Unknown")
-        event_type = message.get("event_type", "Unknown")
-        analysis = message.get("analysis", "No analysis available")
-        severity = message.get("severity", "info")
-
-        # Map severity to emoji
-        emoji_map = {
-            "critical": "🚨",
-            "error": "❌",
-            "warning": "⚠️",
-            "info": "ℹ️",
-        }
-        emoji = emoji_map.get(severity, "📝")
-
-        slack_message = {
-            "text": f"{emoji} Pod Event: {namespace}/{pod_name}",
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": f"{emoji} Pod Event Alert"
-                    }
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Pod:*\n{pod_name}"
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Namespace:*\n{namespace}"
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Event Type:*\n{event_type}"
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Severity:*\n{severity}"
-                        }
-                    ]
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Analysis:*\n{analysis}"
-                    }
+    # We use Slack's "Blocks" format to make the message look professional.
+    # The AI's summary is already in Markdown, so this works perfectly.
+    payload = {
+        "text": "K8s Pod Failure Alert", # Fallback text for notifications
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": ":rotating_light: K8s Pod Failure Alert :rotating_light:",
+                    "emoji": True
                 }
-            ]
-        }
-
-        recommendations = message.get("recommendations", [])
-        if recommendations:
-            slack_message["blocks"].append({
+            },
+            {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*Recommendations:*\n" + "\n".join(f"• {r}" for r in recommendations)
+                    "text": summary_text # The AI-generated summary
                 }
-            })
+            },
+            {
+                "type": "divider"
+            }
+        ]
+    }
 
-        return slack_message
+    try:
+        response = client.post(SLACK_WEBHOOK_URL, json=payload)
+        
+        # Raise an error if Slack didn't return a 200 OK
+        response.raise_for_status() 
+        
+        logger.info(f"Successfully sent alert to Slack. Response: {response.text}")
+
+    except httpx.RequestError as e:
+        logger.error(f"Error sending Slack alert: {e}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred sending to Slack: {e}", exc_info=True)
