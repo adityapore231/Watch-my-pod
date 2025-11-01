@@ -55,7 +55,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	c.informerFactory.Start(stopCh)
 
 	if !cache.WaitForCacheSync(stopCh, c.podInformer.HasSynced) {
-		runtime.HandleError(nil)
+		log.Println("Failed to sync cache")
 		return
 	}
 
